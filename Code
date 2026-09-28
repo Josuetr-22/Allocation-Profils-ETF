@@ -1,0 +1,138 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+# ==============================================================================
+# 1. TIKCERS ETF & DEFINITION DES 4 PROFILS D'ALLOCATION
+# ==============================================================================
+# Tickers ETF Ishares / SPDR :
+# - URTH : MSCI World (Actions Monde)
+# - AGGG : Global Aggregate Bond (Obligations Monde)
+# - GLD  : Gold (Or / Diversification)
+# - BIL  : SPDR Bloomberg 1-3 Month T-Bill (Cash / Taux court)
+tickers = ['URTH', 'AGGG', 'GLD', 'BIL']
+
+# Matrice des allocations pour chaque profil
+allocations = {
+    'Offensif':   {'URTH': 0.80, 'AGGG': 0.10, 'GLD': 0.10, 'BIL': 0.00},
+    '60/40':      {'URTH': 0.60, 'AGGG': 0.40, 'GLD': 0.00, 'BIL': 0.00},
+    'Diversifié': {'URTH': 0.40, 'AGGG': 0.30, 'GLD': 0.20, 'BIL': 0.10},
+    'Prudent':    {'URTH': 0.20, 'AGGG': 0.50, 'GLD': 0.10, 'BIL': 0.20}
+}
+
+print("1. Extraction des cours ajustés sur 10 ans (2016 - 2026)...")
+data = yf.download(tickers, start="2016-01-01", end="2026-09-01", auto_adjust=True)['Close'].dropna()
+
+# ==============================================================================
+# 2. MOTEUR DE SIMULATION AVEC RÉÉQUILIBRAGE MENSUEL
+# ==============================================================================
+# Rendements quotidiens des ETF
+rendements_actifs = data.pct_change().dropna()
+
+# Resampling mensuel pour identifier les dates de rééquilibrage
+dates_reequilibrage = rendements_actifs.resample('M').last().index
+
+def simuler_portefeuille_reequilibre(rendements, poids_target):
+    """
+    Simule la performance d'un portefeuille avec rééquilibrage mensuel des poids.
+    """
+    poids_series = pd.DataFrame(index=rendements.index, columns=rendements.columns)
+    poids_courants = np.array([poids_target[col] for col in rendements.columns])
+    
+    rendements_portefeuille = []
+    
+    for date, row in rendements.iterrows():
+        # Rééquilibrage au début de chaque mois
+        if date in dates_reequilibrage:
+            poids_courants = np.array([poids_target[col] for col in rendements.columns])
+        
+        # Rendement du jour
+        r_jour = np.dot(poids_courants, row.values)
+        rendements_portefeuille.append(r_jour)
+        
+        # Mise à jour des poids sous l'effet de la variation des prix
+        poids_courants = poids_courants * (1 + row.values)
+        poids_courants /= np.sum(poids_courants)
+        
+    return pd.Series(rendements_portefeuille, index=rendements.index)
+
+# Calcul des séries de rendements pour chaque profil
+portefeuilles_ret = pd.DataFrame()
+for profil, poids in allocations.items():
+    portefeuilles_ret[profil] = simuler_portefeuille_reequilibre(rendements_actifs, poids)
+
+# ==============================================================================
+# 3. CALCUL DES MÉTRIQUES RENDEMENT / RISQUE / MAX DRAWDOWN
+# ==============================================================================
+taux_sans_risque = 0.02  # Taux sans risque moyen (2%)
+resultats = {}
+
+for profil in allocations.keys():
+    ret = portefeuilles_ret[profil]
+    
+    # Performance cumulée et CAGR (taux de croissance annuel composé)
+    nav = (1 + ret).cumprod()
+    cagr = (nav.iloc[-1]) ** (252 / len(ret)) - 1
+    
+    # Volatilité et Sharpe
+    vol = ret.std() * np.sqrt(252)
+    sharpe = (cagr - taux_sans_risque) / vol
+    
+    # Perte Maximale (Max Drawdown)
+    peak = nav.cummax()
+    drawdown = (nav - peak) / peak
+    max_drawdown = drawdown.min()
+    
+    resultats[profil] = {
+        'Rendement Annuel (CAGR)': f"{cagr*100:.2f} %",
+        'Volatilité Annuelle': f"{vol*100:.2f} %",
+        'Ratio de Sharpe': f"{sharpe:.2f}",
+        'Perte Maximale (Max DD)': f"{max_drawdown*100:.2f} %"
+    }
+
+df_metrics = pd.DataFrame(resultats)
+
+# ==============================================================================
+# 4. CONTRIBUTION DE CHAQUE ACTIF À LA PERFORMANCE (Exemple Profil Diversifié)
+# ==============================================================================
+poids_div = np.array([allocations['Diversifié'][col] for col in rendements_actifs.columns])
+contrib_actifs = (rendements_actifs.mean() * 252) * poids_div
+df_contrib = pd.DataFrame({'Contribution Annuelle (%)': contrib_actifs * 100}, index=rendements_actifs.columns)
+
+# ==============================================================================
+# 5. DASHBOARD VISUEL
+# ==============================================================================
+plt.style.use('seaborn-v0_8-whitegrid')
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+fig.suptitle("ALLOCATION D'ACTIFS — COMPARAISON DE 4 PROFILS ETF (10 ANS)", fontsize=12, fontweight='bold')
+
+# --- Graphique 1 : Trajectoire des NAVs ---
+nav_all = (1 + portefeuilles_ret).cumprod()
+for col in nav_all.columns:
+    ax1.plot(nav_all.index, nav_all[col], label=col, linewidth=1.8)
+ax1.set_title("Évolution de la Valeur Liquidative (Base 1.0 - Rééquilibrage Mensuel)", fontsize=10, fontweight='bold')
+ax1.set_ylabel("Valeur Liquidative (NAV)")
+ax1.legend(loc='upper left')
+
+# --- Graphique 2 : Contribution des Actifs (Profil Diversifié) ---
+df_contrib.plot(kind='bar', ax=ax2, color='#2c3e50', legend=False)
+ax2.set_title("Contribution Individuelle à la Performance (Profil Diversifié)", fontsize=10, fontweight='bold')
+ax2.set_ylabel("Contribution Annuelle (%)")
+ax2.set_xticklabels(df_contrib.index, rotation=0)
+
+plt.tight_layout()
+
+# ==============================================================================
+# 6. RAPPORT CONSOLE
+# ==============================================================================
+print("\n" + "="*65)
+print("     RAPPORT COMPARATIF DES 4 PROFILS D'ALLOCATION ETF (10 ANS)     ")
+print("="*65)
+print(df_metrics.T)
+print("-" * 65)
+print("CONTRIBUTION À LA PERFORMANCE (PROFIL DIVERSIFIÉ) :")
+print(df_contrib.round(2))
+print("="*65 + "\n")
+
+plt.show()
